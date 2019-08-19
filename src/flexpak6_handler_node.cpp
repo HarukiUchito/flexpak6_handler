@@ -7,7 +7,7 @@
 #include <sstream>
 #include <experimental/optional>
 
-#include "serial_stream.hpp"
+#include <libserial/SerialPort.h>
 
 struct Solution
 {
@@ -21,7 +21,7 @@ struct Solution
 class Flexpak6Handler
 {
 public:
-    Flexpak6Handler() : mLastConnected(false)
+    Flexpak6Handler(std::string path) : mLastConnected(false)
     {
         ros::NodeHandle nh("~");
 
@@ -35,26 +35,22 @@ public:
         mUpdater.add("Connect", boost::bind(&Flexpak6Handler::diagnostic0, this, _1));
 
         // Get and set device path of serial port
-        mDevicePath = "/dev/ttyUSB0";
+        mDevicePath = path;
         nh.getParam("device_name", mDevicePath);
-        mSS.set_name(mDevicePath);
         // Open serial port
-        mSS.ss_open();
-        if (mSS.ss_connected())
-            ROS_INFO("Serial Open %s", mDevicePath.c_str());
-        else
-            ROS_ERROR("Serial Fail: cound not open %s", mDevicePath.c_str());
-        mLastConnected = mSS.ss_connected();
+        open_port();
+
+        mLastConnected = mSerial.IsOpen();
 
         // Receiver Initialization command
         send_command("unlogall true");
-        send_command("log gpgga ontime 1");
+        //send_command("log gpgga ontime 1");
         //send_command("log gpgll ontime 1");
     }
     ~Flexpak6Handler()
     {
-        send_command("unlogall"); // Stop output from receiver
-        mSS.ss_close();
+        send_command("unlogall true"); // Stop output from receiver
+        mSerial.Close();
     }
 
     void mainLoop()
@@ -64,7 +60,7 @@ public:
 
 private:
     std::string mDevicePath;
-    serial_stream mSS;
+    LibSerial::SerialPort mSerial;
 
     ros::Subscriber mSerialSub;
     ros::Publisher mSerialPub;
@@ -75,22 +71,48 @@ private:
 
     bool mLastConnected;
 
+    void open_port()
+    {
+        try
+        {
+            mSerial.Open(mDevicePath.c_str());
+            ROS_INFO("Opend serial port: %s", mDevicePath.c_str());
+        }
+        catch (LibSerial::OpenFailed &)
+        {
+            ROS_ERROR("Serial Fail: cound not open %s", mDevicePath.c_str());
+            return;
+        }
+        // Set the baud rates.
+        mSerial.SetBaudRate(LibSerial::BaudRate::BAUD_9600);
+        // Set the number of data bits.
+        mSerial.SetCharacterSize(LibSerial::CharacterSize::CHAR_SIZE_8);
+        // Turn off hardware flow control.
+        mSerial.SetFlowControl(LibSerial::FlowControl::FLOW_CONTROL_NONE);
+        // Disable parity.
+        mSerial.SetParity(LibSerial::Parity::PARITY_NONE);
+        // Set the number of stop bits.
+        mSerial.SetStopBits(LibSerial::StopBits::STOP_BITS_1);
+    }
+
     void send_command(const std::string c)
     {
         std::string command = c + '\r' + '\n';
-        mSS.ss_write(command);
+        mSerial.Write(command);
+        mSerial.DrainWriteBuffer();
     }
 
     void serial_callback(const std_msgs::String &serial_msg)
     {
-        ROS_DEBUG("Sending : %s\n", serial_msg.data.c_str());
+        ROS_INFO("command : %s\n", serial_msg.data.c_str());
         send_command(serial_msg.data);
+        ROS_INFO("sent.");
     }
 
     void diagnostic0(diagnostic_updater::DiagnosticStatusWrapper &stat)
     {
-        bool serial_c = mSS.ss_connected();
-        bool serial_s = mSS.ss_status();
+        bool serial_c = mSerial.IsOpen();
+        bool serial_s = true;
         if (serial_c && serial_s)
             stat.summaryf(diagnostic_msgs::DiagnosticStatus::OK, "Active.");
         else if (serial_c && !serial_s)
@@ -112,16 +134,19 @@ private:
         Solution ret;
         getline(ss, seg, ','); // utc time
         getline(ss, seg, ','); // lat DDmm.mm
-        if (seg.size()) ret.latitude = stod(seg);
+        if (seg.size())
+            ret.latitude = stod(seg);
         getline(ss, seg, ','); // lat dir
         getline(ss, seg, ','); // lon DDmm.mm
-        if (seg.size()) ret.longitude = stod(seg);
+        if (seg.size())
+            ret.longitude = stod(seg);
         getline(ss, seg, ','); // lon dir
         getline(ss, seg, ','); // quality
         getline(ss, seg, ','); // sats
         getline(ss, seg, ','); // hdop
         getline(ss, seg, ','); // altitude
-        if (seg.size()) ret.height = stod(seg);
+        if (seg.size())
+            ret.height = stod(seg);
 
         while (getline(ss, seg, ','))
         {
@@ -133,19 +158,44 @@ private:
 
     void timer_callback(const ros::TimerEvent &)
     {
-        if (not mSS.ss_connected())
+        if (not mSerial.IsOpen())
         {
             // Retry to connect
-            mSS.ss_open();
-            if (mSS.ss_connected())
-                ROS_INFO("Serial Open %s", mDevicePath.c_str());
-            else
-                ROS_ERROR("Serial Fail: Connection is broken %s", mDevicePath.c_str());
+            open_port();
         }
         else
         {
-            std::string recv_data = mSS.ss_read();
-            if (recv_data.size() > 0)
+            std::string recv_data;
+            try
+            {
+                mSerial.Read(recv_data, 0, 10);
+                if (recv_data.size())
+                {
+                    mBuffer += recv_data;
+                    ROS_INFO("str (%d): %s", int(mBuffer.size()), mBuffer.c_str());
+
+                }
+            }
+            catch (const LibSerial::ReadTimeout &)
+            {
+                if (recv_data.size()) {
+                    //ROS_INFO("truncate: %d : %s", int(recv_data.size()), recv_data.c_str());
+                    mBuffer += recv_data;
+                }
+            }
+            std::stringstream ssBuf(mBuffer);
+            std::string line;
+            int cnt = 0;
+            while (true)
+            {
+                getline(ssBuf, line);
+                if (ssBuf.eof() or ssBuf.fail())
+                    break;
+                cnt++;
+                std::cout << line.c_str() << std::endl;
+            }
+            mBuffer = line;
+            /*if (recv_data.size() > 0)
             {
                 ROS_DEBUG("response (size: %d) : \n%s", int(recv_data.size()), recv_data.c_str());
                 std_msgs::String serial_msg;
@@ -160,21 +210,25 @@ private:
                 int cnt = 0;
                 while (getline(ssBuf, line))
                 {
-                    if (line.size() == 0) continue;
-                    if (line[0] == '<') continue; // Command Result
-                    if (line[0] == '[') continue; // Port info
+                    if (line.size() == 0)
+                        continue;
+                    if (line[0] == '<')
+                        continue; // Command Result
+                    if (line[0] == '[')
+                        continue; // Port info
                     cnt++;
                     ROS_INFO("%d: %s", cnt, line.c_str());
                     auto ret = parseNMEA(line);
-                    if (ret) {
+                    if (ret)
+                    {
                         Solution rv = ret.value();
                         ROS_INFO("parsed as : %f %f %f", rv.latitude, rv.longitude, rv.height);
                     }
                 }
                 mBuffer = "";
-            }
+            }*/
         }
-        mLastConnected = mSS.ss_connected();
+        mLastConnected = mSerial.IsOpen();
         mUpdater.update();
         ros::spinOnce();
     }
@@ -184,8 +238,18 @@ int main(int argc, char **argv)
 {
     ros::init(argc, argv, "flexpak6_handler");
 
-    Flexpak6Handler fh;
-    fh.mainLoop();
+    std::string path;
+    ros::NodeHandle nh("~");
+    if (nh.getParam("path", path))
+    {
+        ROS_INFO("%s", path.c_str());
+        Flexpak6Handler fh(path);
+        fh.mainLoop();
+    }
+    else
+    {
+        std::cerr << "Specify device path using rosparam" << std::endl;
+    }
 
     return 0;
 }

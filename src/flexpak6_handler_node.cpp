@@ -2,6 +2,7 @@
 #include <ros/ros.h>
 #include <std_msgs/String.h>
 #include <diagnostic_updater/diagnostic_updater.h>
+#include <sensor_msgs/NavSatFix.h>
 
 #include <unistd.h>
 #include <sstream>
@@ -27,8 +28,8 @@ public:
 
         // Initialize ros objects
         mSerialSub = nh.subscribe("Serial_out", 1, &Flexpak6Handler::serial_callback, this);
-        mSerialPub = nh.advertise<std_msgs::String>("Serial_in", 1);
         mTimer = nh.createTimer(ros::Duration(0.01), &Flexpak6Handler::timer_callback, this);
+        mGNSSPub = nh.advertise<sensor_msgs::NavSatFix>("nmea_msg", 1);
 
         // Initialize diagnostics objects
         mUpdater.setHardwareID("SerialPort");
@@ -63,7 +64,7 @@ private:
     LibSerial::SerialPort mSerial;
 
     ros::Subscriber mSerialSub;
-    ros::Publisher mSerialPub;
+    ros::Publisher mGNSSPub;
     ros::Timer mTimer;
     diagnostic_updater::Updater mUpdater;
 
@@ -81,7 +82,7 @@ private:
         catch (LibSerial::OpenFailed &)
         {
             ROS_ERROR("Serial Fail: cound not open %s", mDevicePath.c_str());
-            return;
+            throw std::runtime_error("");
         }
         // Set the baud rates.
         mSerial.SetBaudRate(LibSerial::BaudRate::BAUD_9600);
@@ -121,7 +122,7 @@ private:
             stat.summaryf(diagnostic_msgs::DiagnosticStatus::ERROR, "No Connection.");
     }
 
-    std::experimental::optional<Solution> parseNMEA(std::string line)
+    std::experimental::optional<sensor_msgs::NavSatFix> parseNMEA(std::string line)
     {
         std::stringstream ss(line);
         std::string seg;
@@ -131,7 +132,10 @@ private:
         if (seg != "$GPGGA")
             return std::experimental::nullopt;
 
-        Solution ret;
+        sensor_msgs::NavSatFix ret;
+        ret.header.stamp = ros::Time::now();
+        ret.header.frame_id = "gnss";
+
         getline(ss, seg, ','); // utc time
         getline(ss, seg, ','); // lat DDmm.mm
         if (seg.size())
@@ -146,14 +150,14 @@ private:
         getline(ss, seg, ','); // hdop
         getline(ss, seg, ','); // altitude
         if (seg.size())
-            ret.height = stod(seg);
+            ret.altitude = stod(seg);
 
         while (getline(ss, seg, ','))
         {
             //ROS_INFO("  %s", seg.c_str());
         }
 
-        return Solution(0.0, 0.0, 0.0);
+        return ret;
     }
 
     void timer_callback(const ros::TimerEvent &)
@@ -192,41 +196,24 @@ private:
                 if (ssBuf.eof() or ssBuf.fail())
                     break;
                 cnt++;
+            /*
+                if (line.size() == 0)
+                    continue;
+                if (line[0] == '<')
+                    continue; // Command Result
+                if (line[0] == '[')
+                    continue; // Port info
+            */
                 std::cout << line.c_str() << std::endl;
+                auto ret = parseNMEA(line);
+                if (ret)
+                {
+                    auto rv = ret.value();
+                    ROS_INFO("parsed as : %f %f %f", rv.latitude, rv.longitude, rv.altitude);
+                    mGNSSPub.publish(rv);
+                }
             }
             mBuffer = line;
-            /*if (recv_data.size() > 0)
-            {
-                ROS_DEBUG("response (size: %d) : \n%s", int(recv_data.size()), recv_data.c_str());
-                std_msgs::String serial_msg;
-                serial_msg.data = recv_data;
-                mSerialPub.publish(serial_msg);
-
-                mBuffer += recv_data;
-                ROS_DEBUG("Buffer :\n%s", mBuffer.c_str());
-
-                std::stringstream ssBuf(mBuffer);
-                std::string line;
-                int cnt = 0;
-                while (getline(ssBuf, line))
-                {
-                    if (line.size() == 0)
-                        continue;
-                    if (line[0] == '<')
-                        continue; // Command Result
-                    if (line[0] == '[')
-                        continue; // Port info
-                    cnt++;
-                    ROS_INFO("%d: %s", cnt, line.c_str());
-                    auto ret = parseNMEA(line);
-                    if (ret)
-                    {
-                        Solution rv = ret.value();
-                        ROS_INFO("parsed as : %f %f %f", rv.latitude, rv.longitude, rv.height);
-                    }
-                }
-                mBuffer = "";
-            }*/
         }
         mLastConnected = mSerial.IsOpen();
         mUpdater.update();
@@ -248,7 +235,7 @@ int main(int argc, char **argv)
     }
     else
     {
-        std::cerr << "Specify device path using rosparam" << std::endl;
+        throw std::runtime_error("Specify device path using rosparam");
     }
 
     return 0;

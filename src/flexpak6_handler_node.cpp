@@ -45,7 +45,7 @@ public:
 
         // Receiver Initialization command
         send_command("unlogall true");
-        //send_command("log gpgga ontime 1");
+        send_command("log gpgga ontime 0.5");
         //send_command("log gpgll ontime 1");
     }
     ~Flexpak6Handler()
